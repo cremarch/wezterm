@@ -299,13 +299,41 @@ impl TerminalState {
         let screen = self.screen_mut();
         let range =
             screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
-        for idx in range {
+        for idx in range.clone() {
             let line = screen.line_mut(idx);
             for c in line.cells_mut() {
                 c.attrs_mut()
                     .detach_image_with_placement(image_id, placement_id);
             }
             line.update_last_change_seqno(seqno);
+        }
+
+        // The row range recorded in PlacementInfo is captured at placement
+        // time; if the content scrolled or the placement was re-placed since
+        // then, the loop above clears the wrong rows and image cells linger,
+        // ghosting over subsequent content until a reflow rebuilds the lines.
+        // Sweep the rest of the screen (including scrollback) for cells that
+        // still reference this placement. Lines without a match are left
+        // untouched, preserving their storage representation and seqno.
+        for idx in 0..screen.scrollback_rows() {
+            if range.contains(&idx) {
+                continue;
+            }
+            let line = screen.line_mut(idx);
+            let has_match = line.visible_cells().any(|cell| {
+                cell.attrs().images().map_or(false, |images| {
+                    images
+                        .iter()
+                        .any(|im| im.matches_placement(image_id, placement_id))
+                })
+            });
+            if has_match {
+                for c in line.cells_mut() {
+                    c.attrs_mut()
+                        .detach_image_with_placement(image_id, placement_id);
+                }
+                line.update_last_change_seqno(seqno);
+            }
         }
     }
 
