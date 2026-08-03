@@ -194,3 +194,60 @@ fn kitty_unicode_placeholder_without_placement_id_matches_any_placement() {
     let images = cells[0].attrs().images().expect("image tile attached");
     assert_eq!(images[0].image_id(), Some(42));
 }
+
+/// Under tmux passthrough the graphics APC and the placeholder text
+/// travel on independent paths and can arrive in either order. Cells
+/// printed before the image/placement exist must resolve retroactively
+/// once both arrive.
+#[test]
+fn kitty_unicode_placeholder_late_placement_retro_resolves() {
+    let mut term = TestTerm::new(3, 10, 0);
+
+    // placeholder text lands first: stays raw text
+    term.print("\x1b[38;2;0;0;42m");
+    term.print("\u{10eeee}\u{305}\u{305}");
+    {
+        let lines = term.screen().visible_lines();
+        let cell = lines[0].visible_cells().next().unwrap();
+        assert_eq!(cell.attrs().images().is_none(), true);
+    }
+
+    // image data + virtual placement arrive afterwards
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b_Ga=p,U=1,i=42,C=1,c=2,r=2\x1b\\");
+
+    let lines = term.screen().visible_lines();
+    let cells: Vec<_> = lines[0].visible_cells().collect();
+    let images = cells[0].attrs().images().expect("retro-resolved tile");
+    assert_eq!(images[0].image_id(), Some(42));
+}
+
+/// A client that replaces a virtual placement (e.g. re-rendering at a new
+/// size) must see existing placeholder cells re-bind to the new grid, not
+/// keep tiles cut from the old one.
+#[test]
+fn kitty_unicode_placeholder_replaced_placement_rebinds_tiles() {
+    let mut term = TestTerm::new(3, 10, 0);
+
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b_Ga=p,U=1,i=42,C=1,c=2,r=2\x1b\\");
+    term.print("\x1b[38;2;0;0;42m");
+    term.print("\u{10eeee}\u{305}\u{305}");
+    term.print("\u{10eeee}\u{305}\u{30d}");
+    {
+        let lines = term.screen().visible_lines();
+        let cells: Vec<_> = lines[0].visible_cells().collect();
+        let tile = &cells[1].attrs().images().unwrap()[0];
+        assert_eq!(tile.top_left().x.into_inner(), 0.5);
+    }
+
+    // same placement key, wider grid: tile (0,1) is now a quarter column
+    term.print("\x1b_Ga=p,U=1,i=42,C=1,c=4,r=4\x1b\\");
+    let lines = term.screen().visible_lines();
+    let cells: Vec<_> = lines[0].visible_cells().collect();
+    let tile = &cells[1].attrs().images().unwrap()[0];
+    assert_eq!(tile.top_left().x.into_inner(), 0.25);
+    assert_eq!(tile.top_left().y.into_inner(), 0.0);
+}

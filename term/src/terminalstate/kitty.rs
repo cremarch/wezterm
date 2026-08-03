@@ -266,7 +266,7 @@ impl TerminalState {
             rows
         );
 
-        self.kitty_img.virtual_placements.insert(
+        let old_vp = self.kitty_img.virtual_placements.insert(
             (image_id, placement.placement_id),
             KittyVirtualPlacement {
                 cols,
@@ -281,6 +281,7 @@ impl TerminalState {
             cols,
             rows
         );
+        self.kitty_retro_resolve_placeholders(image_id, old_vp);
         Ok(())
     }
 
@@ -417,6 +418,126 @@ impl TerminalState {
         let row = (img.top_left().y.into_inner() * vp.rows as f32).round() as u32;
         let col = (img.top_left().x.into_inner() * vp.cols as f32).round() as u32;
         Some((row, col))
+    }
+
+    /// Re-resolve placeholder cells for `image_id` on the visible screen.
+    ///
+    /// Placeholder cells resolve at print time, but the graphics APC and
+    /// the placeholder text can arrive in either order (tmux passthrough
+    /// delivers them on independent paths), and a client may replace a
+    /// virtual placement while its placeholder cells are on screen. Kitty
+    /// resolves placeholders at render time so neither case has a visible
+    /// window; approximate that by re-scanning the screen when the
+    /// placement side of an image changes: raw placeholder text resolves
+    /// as if just printed, and tiles attached against `old_vp` re-attach
+    /// against the current placement.
+    fn kitty_retro_resolve_placeholders(
+        &mut self,
+        image_id: u32,
+        old_vp: Option<KittyVirtualPlacement>,
+    ) {
+        if !self.config.enable_kitty_graphics() {
+            return;
+        }
+        enum Retry {
+            Raw(String, CellAttributes),
+            Stale {
+                row: u32,
+                col: u32,
+                placement_id: Option<u32>,
+                pen: CellAttributes,
+            },
+        }
+        let seqno = self.seqno;
+        let rows = self.screen().physical_rows;
+        let cols = self.screen().physical_cols;
+        for y in 0..rows {
+            let y = y as VisibleRowIndex;
+            for x in 0..cols {
+                let retry = {
+                    let cell = match self.screen_mut().get_cell(x, y) {
+                        Some(cell) => cell,
+                        None => continue,
+                    };
+                    let g = cell.str();
+                    if g.starts_with(KITTY_UNICODE_PLACEHOLDER) {
+                        Retry::Raw(g.to_string(), cell.attrs().clone())
+                    } else if let (Some(old), Some(images)) = (old_vp, cell.attrs().images()) {
+                        match images.iter().find(|i| i.image_id() == Some(image_id)) {
+                            Some(tile) => {
+                                let row =
+                                    (tile.top_left().y.into_inner() * old.rows as f32).round()
+                                        as u32;
+                                let col =
+                                    (tile.top_left().x.into_inner() * old.cols as f32).round()
+                                        as u32;
+                                let mut pen = cell.attrs().clone();
+                                pen.clear_images();
+                                Retry::Stale {
+                                    row,
+                                    col,
+                                    placement_id: tile.placement_id(),
+                                    pen,
+                                }
+                            }
+                            None => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                };
+                match retry {
+                    Retry::Raw(g, pen) => {
+                        self.kitty_print_unicode_placeholder(x, y, &g, &pen, seqno);
+                    }
+                    Retry::Stale {
+                        row,
+                        col,
+                        placement_id,
+                        pen,
+                    } => {
+                        let vp = match self
+                            .kitty_img
+                            .virtual_placements
+                            .get(&(image_id, placement_id))
+                            .or_else(|| self.kitty_img.virtual_placements.get(&(image_id, None)))
+                        {
+                            Some(vp) => *vp,
+                            None => continue,
+                        };
+                        let img = match self.kitty_img.id_to_data.get(&image_id) {
+                            Some(img) => Arc::clone(img),
+                            None => continue,
+                        };
+                        let mut cell = Cell::new(' ', pen);
+                        if (row as usize) < vp.rows && (col as usize) < vp.cols {
+                            let cols_f = vp.cols as f32;
+                            let rows_f = vp.rows as f32;
+                            cell.attrs_mut()
+                                .attach_image(Box::new(ImageCell::with_z_index(
+                                    TextureCoordinate::new_f32(
+                                        col as f32 / cols_f,
+                                        row as f32 / rows_f,
+                                    ),
+                                    TextureCoordinate::new_f32(
+                                        (col + 1) as f32 / cols_f,
+                                        (row + 1) as f32 / rows_f,
+                                    ),
+                                    img,
+                                    vp.z_index,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    Some(image_id),
+                                    placement_id,
+                                )));
+                        }
+                        self.screen_mut().set_cell(x, y, &cell, seqno);
+                    }
+                }
+            }
+        }
     }
 
     fn kitty_img_inner(&mut self, img: KittyImage) -> anyhow::Result<()> {
@@ -1175,6 +1296,7 @@ impl TerminalState {
             .raw_image_to_image_data(img)
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img);
+        self.kitty_retro_resolve_placeholders(image_id, None);
 
         if image_number.is_some() {
             self.kitty_send_response(
